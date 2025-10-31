@@ -19,6 +19,7 @@ base-reth-transaction-tracing.workspace = true
 
 # proof helper exex
 reth-optimism-exex = { workspace = true }
+reth-optimism-trie = { workspace = true }
 
 # reth
 reth.workspace = true
