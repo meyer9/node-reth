@@ -1,10 +1,10 @@
 use base_reth_flashblocks_rpc::rpc::EthApiExt;
 use futures_util::TryStreamExt;
-use once_cell::sync::OnceCell;
 use reth::version::{
     default_reth_version_metadata, try_init_version_metadata, RethCliVersionConsts,
 };
 use reth_exex::ExExEvent;
+use std::cell::{LazyCell, OnceCell};
 use std::sync::Arc;
 
 use base_reth_flashblocks_rpc::rpc::EthApiOverrideServer;
@@ -19,6 +19,7 @@ use reth::{
     providers::providers::BlockchainProvider,
 };
 use reth_optimism_cli::{chainspec::OpChainSpecParser, Cli};
+use reth_optimism_exex::OpProofsExEx;
 use reth_optimism_node::args::RollupArgs;
 use reth_optimism_node::OpNode;
 use tracing::info;
@@ -55,6 +56,23 @@ struct Args {
     /// Enable metering RPC for transaction bundle simulation
     #[arg(long = "enable-metering", value_name = "ENABLE_METERING")]
     pub enable_metering: bool,
+
+    /// If true, initialize external-proofs exex to save and serve trie nodes to provide proofs
+    /// faster.
+    #[arg(
+        long = "proofs-history",
+        value_name = "PROOFS_HISTORY",
+        default_value = "false"
+    )]
+    pub proofs_history: bool,
+
+    /// The path to the storage DB for proofs history.
+    #[arg(
+        long = "proofs-history.storage-path",
+        value_name = "PROOFS_HISTORY_STORAGE_PATH",
+        required_if_eq("proofs-history", "true")
+    )]
+    pub proofs_history_storage_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -92,11 +110,25 @@ fn main() {
             info!(message = "starting custom Base node");
 
             let flashblocks_enabled = args.flashblocks_enabled();
+            let proofs_history_enabled = args.proofs_history;
+
             let transaction_tracing_enabled = args.enable_transaction_tracing;
             let metering_enabled = args.enable_metering;
             let op_node = OpNode::new(args.rollup_args.clone());
 
             let fb_cell: Arc<OnceCell<Arc<FlashblocksState<_>>>> = Arc::new(OnceCell::new());
+
+            let proofs_storage_cell: Arc<LazyCell<Result<Arc<MdbxProofsStorage<_>>, eyre::Error>>> =
+                Arc::new(LazyCell::new(|| {
+                    let path = args
+                        .proofs_history_storage_path
+                        .expect("path must be set when proofs history is enabled");
+                    Arc::new(
+                        MdbxProofsStorage::new(args.proofs_history_storage_path.unwrap())
+                            .map_err(|e| eyre::eyre!("Failed to create MdbxProofsStorage: {e}"))?,
+                    )
+                    .into()
+                }));
 
             let NodeHandle {
                 node: _node,
@@ -136,6 +168,35 @@ fn main() {
                             Ok(())
                         })
                     }
+                })
+                .install_exex_if(
+                    proofs_history_enabled,
+                    "proofs-history",
+                    async move |exex_context| {
+                        Ok(OpProofsExEx::new(
+                            exex_context,
+                            storage_exec,
+                            args.proofs_history_window,
+                        )
+                        .run()
+                        .boxed())
+                    },
+                )
+                .extend_rpc_modules(move |ctx| {
+                    if proofs_history_enabled {
+                        let api_ext =
+                            EthApiExt::new(ctx.registry.eth_api().clone(), storage_rpc.clone());
+                        let debug_ext = DebugApiExt::new(
+                            ctx.node().provider().clone(),
+                            ctx.registry.eth_api().clone(),
+                            storage_rpc,
+                            Box::new(ctx.node().task_executor().clone()),
+                            ctx.node().evm_config().clone(),
+                        );
+                        ctx.modules.replace_configured(api_ext.into_rpc())?;
+                        ctx.modules.replace_configured(debug_ext.into_rpc())?;
+                    }
+                    Ok(())
                 })
                 .extend_rpc_modules(move |ctx| {
                     if metering_enabled {
