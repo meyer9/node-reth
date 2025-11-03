@@ -1,10 +1,13 @@
 use base_reth_flashblocks_rpc::rpc::EthApiExt;
 use futures_util::{FutureExt, TryStreamExt};
+use jsonrpsee::core::{async_trait, RpcResult};
+use jsonrpsee::proc_macros::rpc;
 use reth::version::{
     default_reth_version_metadata, try_init_version_metadata, RethCliVersionConsts,
 };
 use reth_exex::ExExEvent;
-use std::cell::{OnceCell};
+use reth_optimism_trie::OpProofsStore;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -19,17 +22,73 @@ use reth::{
     api::FullNodeComponents,
     builder::{EngineNodeLauncher, TreeConfig},
     providers::providers::BlockchainProvider,
+    rpc::result::internal_rpc_err,
 };
 use reth_optimism_cli::{chainspec::OpChainSpecParser, Cli};
 use reth_optimism_exex::OpProofsExEx;
-use reth_optimism_trie::{OpProofsStorage, db::MdbxProofsStorage, OpProofsStorageError};
-use reth_optimism_rpc::{debug::{DebugApiExt, DebugApiOverrideServer},     eth::proofs::{EthApiExt as OpEthApiExt, EthApiOverrideServer as OpEthApiOverrideServer}};
 use reth_optimism_node::args::RollupArgs;
 use reth_optimism_node::OpNode;
+use reth_optimism_rpc::{
+    debug::{DebugApiExt, DebugApiOverrideServer},
+    eth::proofs::{EthApiExt as OpEthApiExt, EthApiOverrideServer as OpEthApiOverrideServer},
+};
+use reth_optimism_trie::{db::MdbxProofsStorage, OpProofsStorage};
 use tracing::info;
 use url::Url;
 
 pub const NODE_RETH_CLIENT_VERSION: &str = concat!("base/v", env!("CARGO_PKG_VERSION"));
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ProofsSyncStatus {
+    earliest: Option<u64>,
+    latest: Option<u64>,
+}
+
+#[cfg_attr(not(test), rpc(server, namespace = "base"))]
+#[cfg_attr(test, rpc(server, client, namespace = "base"))]
+trait BaseApiRpc {
+    #[method(name = "proofsSyncStatus")]
+    async fn proofs_sync_status(&self) -> RpcResult<ProofsSyncStatus>;
+}
+
+#[derive(Debug)]
+/// Overrides applied to the `eth_` namespace of the RPC API for historical proofs ExEx.
+pub struct BaseApiRpc<P> {
+    external_storage: P,
+}
+
+impl<P> BaseApiRpc<P>
+where
+    P: OpProofsStore + Clone + 'static,
+{
+    pub fn new(external_storage: P) -> Self {
+        Self { external_storage }
+    }
+}
+
+#[async_trait]
+impl<P> BaseApiRpcServer for BaseApiRpc<P>
+where
+    P: OpProofsStore + Clone + 'static,
+{
+    async fn proofs_sync_status(&self) -> RpcResult<ProofsSyncStatus> {
+        let earliest = self
+            .external_storage
+            .get_earliest_block_number()
+            .await
+            .map_err(|err| internal_rpc_err(err.to_string()))?;
+        let latest = self
+            .external_storage
+            .get_latest_block_number()
+            .await
+            .map_err(|err| internal_rpc_err(err.to_string()))?;
+
+        Ok(ProofsSyncStatus {
+            earliest: earliest.map(|(block_number, _)| block_number),
+            latest: latest.map(|(block_number, _)| block_number),
+        })
+    }
+}
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
@@ -74,7 +133,7 @@ struct Args {
     #[arg(
         long = "proofs-history.storage-path",
         value_name = "PROOFS_HISTORY_STORAGE_PATH",
-        required_if_eq("proofs-history", "true")
+        required_if_eq("proofs_history", "true")
     )]
     pub proofs_history_storage_path: Option<PathBuf>,
 }
@@ -122,8 +181,8 @@ fn main() {
 
             let fb_cell: Arc<OnceLock<Arc<FlashblocksState<_>>>> = Arc::new(OnceLock::new());
 
-            let proofs_storage_cell =
-                Arc::new(LazyLock::new(|| -> Arc<OpProofsStorage<MdbxProofsStorage>> {
+            let proofs_storage_cell = Arc::new(LazyLock::new(
+                || -> Arc<OpProofsStorage<MdbxProofsStorage>> {
                     let path = args
                         .proofs_history_storage_path
                         .expect("path must be set when proofs history is enabled");
@@ -133,7 +192,8 @@ fn main() {
                     .into();
 
                     result
-                }));
+                },
+            ));
 
             let proofs_storage_cell_exex = proofs_storage_cell.clone();
             let proofs_storage_cell_rpc = proofs_storage_cell.clone();
@@ -231,8 +291,10 @@ fn main() {
                 .extend_rpc_modules(move |ctx| {
                     if proofs_history_enabled {
                         let proofs_storage = (*(proofs_storage_cell_rpc)).clone();
-                        let api_ext =
-                            OpEthApiExt::new(ctx.registry.eth_api().clone(), proofs_storage.clone());
+                        let api_ext = OpEthApiExt::new(
+                            ctx.registry.eth_api().clone(),
+                            proofs_storage.clone(),
+                        );
                         let debug_ext = DebugApiExt::new(
                             ctx.node().provider().clone(),
                             ctx.registry.eth_api().clone(),
@@ -240,6 +302,8 @@ fn main() {
                             Box::new(ctx.node().task_executor().clone()),
                             ctx.node().evm_config().clone(),
                         );
+                        let base_api_rpc = BaseApiRpc::new(proofs_storage.clone());
+                        ctx.modules.replace_configured(base_api_rpc.into_rpc())?;
                         ctx.modules.replace_configured(api_ext.into_rpc())?;
                         ctx.modules.replace_configured(debug_ext.into_rpc())?;
                     }
